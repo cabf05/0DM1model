@@ -3,32 +3,38 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# =========================================================
-# App configuration
-# =========================================================
+st.set_page_config(page_title="Untreated Type 1 Diabetes Simulator", layout="wide")
 
-st.set_page_config(
-    page_title="Untreated Type 1 Diabetes – Physiological Simulator",
-    layout="wide"
-)
-
-# =========================================================
+# =========================
 # Sidebar – Parameters
-# =========================================================
+# =========================
+st.sidebar.header("Patient & Physiological Parameters")
 
-st.sidebar.title("Physiology – Untreated T1DM")
-
-weight = st.sidebar.slider("Body weight (kg)", 40, 120, 70)
+weight = st.sidebar.slider(
+    "Body weight (kg)",
+    30, 120, 70
+)
 
 egp_baseline = st.sidebar.slider(
     "Baseline endogenous glucose production (mg/kg/min)",
     1.5, 3.0, 1.6,
-    help="Basal EGP before insulin withdrawal"
+    help="Normal basal EGP ~1.5–2.0 mg/kg/min. In untreated T1DM, "
+         "EGP may increase by ~60% due to unopposed glucagon and "
+         "counter-regulatory hormones."
 )
 
-brain_uptake = st.sidebar.slider(
-    "Insulin-independent glucose uptake (mg/kg/min)",
-    1.0, 1.6, 1.2
+gfr = st.sidebar.slider(
+    "Glomerular filtration rate (mL/kg/min)",
+    1.0, 2.5, 1.7,
+    help="Normal adult GFR ≈ 1.5–2.0 mL/kg/min. "
+         "Lower values simulate renal impairment."
+)
+
+vd = st.sidebar.slider(
+    "Glucose distribution volume (L/kg)",
+    0.15, 0.25, 0.20,
+    help="Physiological glucose Vd ≈ 0.18–0.23 L/kg, representing "
+         "the extracellular fluid space."
 )
 
 renal_threshold = st.sidebar.slider(
@@ -36,220 +42,185 @@ renal_threshold = st.sidebar.slider(
     160, 220, 180
 )
 
-st.sidebar.divider()
-st.sidebar.title("Meal & Simulation")
+tmax = st.sidebar.slider(
+    "Max tubular glucose reabsorption (mg/min)",
+    250, 450, 375
+)
 
-meal_carbs = st.sidebar.slider("Meal carbohydrates (g)", 0, 150, 60)
-meal_time = st.sidebar.slider("Meal time (hours)", 0, 24, 8)
-simulation_hours = st.sidebar.slider("Simulation duration (hours)", 6, 48, 24)
+brain_util = st.sidebar.slider(
+    "Insulin-independent glucose utilization (mg/kg/min)",
+    0.8, 2.5, 1.5,
+    help="Primarily brain uptake. Increases nonlinearly at "
+         "very high glucose concentrations."
+)
 
-noise_level = st.sidebar.slider("Physiological variability", 0.0, 5.0, 1.0)
+st.sidebar.header("Meal Simulation")
 
-# =========================================================
-# Physiological constants
-# =========================================================
+carbs_g = st.sidebar.slider(
+    "Carbohydrate load (grams)",
+    0, 150, 60
+)
 
-DT = 1                      # min
-Vd = 0.20                   # L/kg (glucose distribution volume)
-GFR = 1.7                   # mL/kg/min
-TMAX_GLUCOSE = 375          # mg/min (max tubular reabsorption)
+meal_absorption = st.sidebar.slider(
+    "Fraction absorbed by 5h",
+    0.6, 0.9, 0.8,
+    help="Mixed meals ≈60%; pure carbohydrate loads may reach 80–90%."
+)
 
-# =========================================================
-# Time grid
-# =========================================================
+st.sidebar.header("Simulation")
 
-time = np.arange(0, simulation_hours * 60, DT)
+hours = st.sidebar.slider("Simulation duration (hours)", 6, 48, 24)
+dt = 5  # minutes
 
-# =========================================================
-# Meal absorption (slow, incomplete)
-# =========================================================
+# =========================
+# Time Vector
+# =========================
+time = np.arange(0, hours * 60 + dt, dt)
+n = len(time)
 
-def meal_absorption(t, meal_time_h, carbs_g, weight):
-    if carbs_g == 0:
-        return np.zeros_like(t)
+# =========================
+# State Variables
+# =========================
+glucose = np.zeros(n)
+ketones = np.zeros(n)
+urinary_glucose = np.zeros(n)
+urine_volume = np.zeros(n)
+egp_cumulative = np.zeros(n)
 
-    duration = 300  # 5 hours
-    std = 60
-    peak = meal_time_h * 60 + 60
+glucose[0] = 100
+ketones[0] = 0.3
 
-    x = np.arange(duration)
-    kernel = np.exp(-0.5 * ((x - duration / 2) / std) ** 2)
-    kernel /= kernel.sum()
+# =========================
+# Meal Absorption Curve
+# =========================
+meal_absorption_curve = np.zeros(n)
+if carbs_g > 0:
+    absorbed_total_mg = carbs_g * 1000 * meal_absorption
+    tau = 90  # minutes
+    for i, t in enumerate(time):
+        meal_absorption_curve[i] = absorbed_total_mg * (t / tau) * np.exp(1 - t / tau)
+    meal_absorption_curve = meal_absorption_curve / meal_absorption_curve.sum()
 
-    absorbed = carbs_g * 1000 * 0.6 * kernel
-    signal = np.zeros_like(t)
+# =========================
+# Simulation Loop
+# =========================
+for i in range(1, n):
+    hours_elapsed = time[i] / 60
 
-    start = int(peak - duration / 2)
-    end = start + duration
+    # Progressive EGP increase (max +60%)
+    egp_multiplier = min(1 + 0.1 * hours_elapsed, 1.6)
+    egp = egp_baseline * egp_multiplier
 
-    if start >= 0 and end < len(t):
-        signal[start:end] = absorbed
+    egp_mg = egp * weight * dt
+    egp_cumulative[i] = egp_cumulative[i-1] + egp_mg / 1000
 
-    return signal / weight  # mg/kg/min
+    # Insulin-independent utilization (nonlinear)
+    util = brain_util * weight * dt
+    if glucose[i-1] > 250:
+        util *= 1.2
 
-meal_signal = meal_absorption(time, meal_time, meal_carbs, weight)
+    # Meal input
+    meal_input = meal_absorption_curve[i] if carbs_g > 0 else 0
 
-# =========================================================
-# State variables
-# =========================================================
+    # Renal glucose handling
+    filtered = glucose[i-1] * gfr * weight * dt / 100
+    reabsorbed = min(filtered, tmax * dt)
+    urinary = max(filtered - reabsorbed, 0)
 
-G = np.zeros_like(time)
-G[0] = 100
+    urinary_glucose[i] = urinary
 
-ketones = np.zeros_like(time)        # mmol/L (β-hydroxybutyrate)
-urinary_glucose = np.zeros_like(time)  # mg
-urine_volume = np.zeros_like(time)     # L
-glucose_roc = np.zeros_like(time)      # mg/dL/h
+    # Osmotic diuresis (18 mL per gram)
+    urine_volume[i] = (urinary / 1000) * 0.018
 
-# =========================================================
-# Simulation loop
-# =========================================================
+    # Net glucose mass balance
+    dG = egp_mg + meal_input - util - urinary
 
-for i in range(1, len(time)):
-    glucose = G[i - 1]
+    # Convert mass → concentration
+    glucose[i] = glucose[i-1] + (dG / (vd * weight)) / 10
 
-    # ---------------------------------------------
-    # Progressive EGP increase during insulin lack
-    # ---------------------------------------------
-    hours_hyper = np.sum(G[:i] > 180) / 60
-    egp_multiplier = min(1 + 0.1 * hours_hyper, 1.6)
-
-    # Dawn phenomenon (4–8 AM)
-    hour = (time[i] / 60) % 24
-    dawn_multiplier = 1.15 if 4 <= hour <= 8 else 1.0
-
-    egp = egp_baseline * egp_multiplier * dawn_multiplier
-
-    # ---------------------------------------------
-    # Insulin-independent glucose uptake
-    # ---------------------------------------------
-    if glucose > 180:
-        u_ii = brain_uptake * (1 + 0.01 * (glucose - 180))
+    # Ketogenesis (nonlinear, autocatalytic)
+    if glucose[i] > 200:
+        ketone_rate = 0.0015 * (glucose[i] - 200) * (1 + ketones[i-1] / 10)
+        ketones[i] = ketones[i-1] + ketone_rate * dt / 60
     else:
-        u_ii = brain_uptake
+        ketones[i] = max(ketones[i-1] - 0.01, 0.1)
 
-    # ---------------------------------------------
-    # Renal glucose handling (with Tmax)
-    # ---------------------------------------------
-    if glucose > renal_threshold:
-        GFR_total = GFR * weight  # mL/min
-        filtered = (GFR_total / 1000) * glucose  # g/min
-        reabsorbed = min(filtered, TMAX_GLUCOSE / 1000)
-        excreted = max(filtered - reabsorbed, 0)
-        renal_mg_kg_min = (excreted * 1000) / weight
-    else:
-        renal_mg_kg_min = 0
+# =========================
+# Metrics
+# =========================
+roc = np.diff(glucose) / (dt / 60)
+max_roc = roc.max() if len(roc) > 0 else 0
 
-    urinary_glucose[i] = urinary_glucose[i - 1] + renal_mg_kg_min * DT
-    urine_volume[i] = urinary_glucose[i] * 0.018 / 1000  # L
-
-    # ---------------------------------------------
-    # Ketogenesis (nonlinear, NEFA-driven)
-    # ---------------------------------------------
-    if glucose > 200:
-        ketone_rate = 0.0015 * (glucose - 200) * (1 + ketones[i - 1] / 10)
-        ketones[i] = ketones[i - 1] + ketone_rate * DT
-    else:
-        ketones[i] = max(ketones[i - 1] - 0.002 * DT, 0)
-
-    # ---------------------------------------------
-    # Glucose mass balance
-    # ---------------------------------------------
-    dG_mass = egp + meal_signal[i] - u_ii - renal_mg_kg_min
-
-    # Convert mass (mg/kg/min) → concentration (mg/dL/min)
-    dG_conc = (dG_mass / Vd) / 10
-
-    noise = np.random.normal(0, noise_level)
-    G[i] = max(glucose + dG_conc + noise, 40)
-
-    # ---------------------------------------------
-    # Rate of glucose rise (mg/dL/h)
-    # ---------------------------------------------
-    if i >= 60:
-        glucose_roc[i] = G[i] - G[i - 60]
-
-# =========================================================
-# Output DataFrame
-# =========================================================
-
-df = pd.DataFrame({
-    "Time (h)": time / 60,
-    "Glucose (mg/dL)": G,
-    "Ketones (mmol/L)": ketones,
-    "Urinary glucose (g)": urinary_glucose / 1000,
-    "Urine volume (L)": urine_volume,
-    "Glucose ROC (mg/dL/h)": glucose_roc
-})
-
-# =========================================================
+# =========================
 # Visualization
-# =========================================================
+# =========================
+st.title("Untreated Type 1 Diabetes Educational Simulator")
 
-st.title("Untreated Type 1 Diabetes – Advanced Physiological Simulator")
+col1, col2 = st.columns(2)
 
-fig, ax = plt.subplots(figsize=(12, 5))
-ax.plot(df["Time (h)"], df["Glucose (mg/dL)"], linewidth=2)
-ax.axhline(180, linestyle="--", color="orange", label="Hyperglycemia")
-ax.axhline(250, linestyle="--", color="red", label="DKA Risk")
-ax.set_xlabel("Time (h)")
-ax.set_ylabel("Glucose (mg/dL)")
-ax.legend()
-st.pyplot(fig)
+with col1:
+    st.subheader("Plasma Glucose (mg/dL)")
+    fig, ax = plt.subplots()
+    ax.plot(time / 60, glucose)
+    ax.axhline(180, linestyle="--")
+    ax.axhline(250, linestyle="--")
+    ax.set_xlabel("Hours")
+    ax.set_ylabel("mg/dL")
+    st.pyplot(fig)
 
-# =========================================================
-# Clinical indicators
-# =========================================================
+with col2:
+    st.subheader("Ketones (β-hydroxybutyrate, mmol/L)")
+    fig, ax = plt.subplots()
+    ax.plot(time / 60, ketones)
+    ax.axhline(3.0, color="red", linestyle="--")
+    ax.set_xlabel("Hours")
+    ax.set_ylabel("mmol/L")
+    st.pyplot(fig)
 
-dka_time = (
-    np.argmax(ketones >= 3.0) / 60
-    if np.any(ketones >= 3.0)
-    else None
+st.subheader("Educational Indicators")
+
+st.metric(
+    "Max glucose rate of rise (mg/dL/hour)",
+    f"{max_roc:.1f}",
+    delta="⚠️ Severe dysregulation" if max_roc > 60 else None
 )
 
-st.subheader("Clinical & Educational Indicators")
-
-c1, c2, c3, c4, c5 = st.columns(5)
-
-c1.metric("Peak glucose", f"{np.max(G):.0f} mg/dL")
-c2.metric("Max glucose ROC", f"{np.max(glucose_roc):.0f} mg/dL/h")
-c3.metric("Urinary glucose loss", f"{urinary_glucose[-1]/1000:.1f} g")
-c4.metric("Urine volume", f"{urine_volume[-1]:.1f} L")
-c5.metric(
-    "Time to DKA",
-    f"{dka_time:.1f} h" if dka_time else "Not reached"
+st.metric(
+    "Total endogenous glucose produced (g)",
+    f"{egp_cumulative[-1]:.1f}"
 )
 
-# =========================================================
-# Interpretation
-# =========================================================
+st.metric(
+    "Total urinary glucose loss (g)",
+    f"{urinary_glucose.sum() / 1000:.1f}"
+)
 
+st.metric(
+    "Total urine volume from glycosuria (L)",
+    f"{urine_volume.sum():.2f}"
+)
+
+# =========================
+# Educational Messages
+# =========================
 st.subheader("Physiological Interpretation")
 
-if dka_time:
-    st.error(
-        "β-hydroxybutyrate exceeds 3.0 mmol/L, meeting clinical criteria for DKA. "
-        "This reflects unchecked lipolysis and hepatic ketogenesis in the absence of insulin."
-    )
-elif np.max(glucose_roc) > 56:
+if glucose.max() > 250:
     st.warning(
-        "Rate of glucose rise exceeds physiological limits, illustrating "
-        "the instability of glucose control without insulin."
-    )
-else:
-    st.info(
-        "Progressive hyperglycemia emerges from delayed but sustained counter-regulatory responses."
+        "Sustained hyperglycemia >250 mg/dL demonstrates "
+        "unopposed hepatic glucose production and inadequate "
+        "renal compensation without insulin."
     )
 
-# =========================================================
-# Export
-# =========================================================
+if ketones.max() >= 3.0:
+    st.error(
+        "Ketone levels reached the DKA threshold (≥3.0 mmol/L), "
+        "illustrating the absolute requirement for insulin in T1DM."
+    )
 
-st.subheader("Download simulation data")
-
-st.download_button(
-    "Download CSV",
-    df.to_csv(index=False),
-    file_name="untreated_t1dm_advanced_simulation.csv",
-    mime="text/csv"
+st.info(
+    "This simulator is for educational purposes only. It demonstrates "
+    "why insulin is physiologically mandatory in type 1 diabetes and "
+    "why renal glucose loss and insulin-independent utilization "
+    "cannot prevent metabolic decompensation."
 )
