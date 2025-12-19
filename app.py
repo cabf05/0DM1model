@@ -67,14 +67,20 @@ noise_level = st.sidebar.slider(
 )
 
 # =========================================================
-# Physiological constants
+# Physiological constants & ketone model params
 # =========================================================
 DT = 1.0                    # min
 Vd = 0.22                   # L/kg (glucose distribution volume)
 TMAX_GLUCOSE = 375          # mg/min (max tubular reabsorption)
 
+# Insulin-independent uptake saturation (Michaelis-Menten)
 U_II_MAX = 2.0              # mg/kg/min, max insulin-independent uptake
-KM_UPTAKE = 180             # mg/dL, half-saturation for Michaelis-Menten
+KM_UPTAKE = 180.0           # mg/dL, half-saturation
+
+# Ketone model parameters (conservative, physiologically constrained)
+KETONE_MAX = 25.0           # mmol/L physiological ceiling
+KETONE_PROD_MAX = 0.003     # mmol/L/min — max production rate (tunable)
+KETONE_CLEARANCE_RATE = 0.002  # per min, first-order clearance when glucose normal
 
 # =========================================================
 # Time grid
@@ -102,12 +108,12 @@ def meal_absorption(t, meal_time_h, carbs_g, weight, fraction):
         signal[start:end] = absorbed
     elif start < len(t):
         signal[start:] = absorbed[:len(t)-start]
-    return signal / weight
+    return signal / weight  # mg/kg/min
 
 meal_signal = meal_absorption(time, meal_time, meal_carbs, weight, meal_absorption_fraction)
 
 # =========================================================
-# State variables
+# State variables (unchanged interface)
 # =========================================================
 G = np.zeros(n_steps, dtype=float)
 G[0] = 100.0
@@ -120,11 +126,21 @@ egp_array = np.zeros(n_steps, dtype=float)
 uptake_array = np.zeros(n_steps, dtype=float)
 renal_array = np.zeros(n_steps, dtype=float)
 
+# safeguard flag
+numerical_instability = False
+instability_message = ""
+
 # =========================================================
-# Simulation loop
+# Simulation loop (with corrected ketone model and safeguards)
 # =========================================================
 for i in range(1, n_steps):
     glucose = G[i - 1]
+
+    # quick numerical checks on previous ketone to avoid carrying NaN/inf
+    if not np.isfinite(ketones[i-1]) or ketones[i-1] < 0 or ketones[i-1] > 1e6:
+        numerical_instability = True
+        instability_message = f"Numerical instability detected at t={time[i-1]/60:.2f} h: ketones={ketones[i-1]:.3e}"
+        break
 
     # Progressive EGP
     hours_hyper = np.sum(G[:i] > 180) / 60.0
@@ -136,34 +152,57 @@ for i in range(1, n_steps):
 
     egp = egp_baseline * egp_multiplier * dawn_multiplier
     egp_array[i] = egp
-    cumulative_egp[i] = cumulative_egp[i-1] + egp * DT * weight / 1000.0
+    cumulative_egp[i] = cumulative_egp[i-1] + egp * DT * weight / 1000.0  # grams
 
-    # Insulin-independent uptake (Michaelis-Menten saturation)
-    u_ii = U_II_MAX * glucose / (KM_UPTAKE + glucose)
+    # Insulin-independent uptake (Michaelis-Menten)
+    u_ii = U_II_MAX * glucose / (KM_UPTAKE + glucose)  # mg/kg/min
     uptake_array[i] = u_ii
 
-    # Renal glucose handling (mg/dL → mg/min)
+    # Renal glucose handling (mg/dL → mg/min correct)
     if glucose > renal_threshold:
         GFR_total = GFR * weight  # mL/min
-        filtered_mg_min = (GFR_total * glucose) / 100.0  # correct mg/min
-        reabsorbed_mg_min = min(filtered_mg_min, TMAX_GLUCOSE)
-        excreted_mg_min = max(filtered_mg_min - reabsorbed_mg_min, 0.0)
-        renal_mg_kg_min = excreted_mg_min / weight
+        filtered_mg_min = (GFR_total * glucose) / 100.0  # mg/min
+        reabsorbed_mg_min = min(filtered_mg_min, TMAX_GLUCOSE)  # mg/min
+        excreted_mg_min = max(filtered_mg_min - reabsorbed_mg_min, 0.0)  # mg/min
+        renal_mg_kg_min = excreted_mg_min / weight  # mg/kg/min
     else:
         renal_mg_kg_min = 0.0
     renal_array[i] = renal_mg_kg_min
 
-    urinary_glucose[i] = urinary_glucose[i-1] + renal_mg_kg_min * weight * DT
-    urine_volume[i] = (urinary_glucose[i] / 1000.0) * 0.018
+    # Cumulative urinary glucose and urine volume
+    urinary_glucose[i] = urinary_glucose[i-1] + renal_mg_kg_min * weight * DT  # mg total
+    urine_volume[i] = (urinary_glucose[i] / 1000.0) * 0.018  # L (18 mL per gram)
 
-    # Ketogenesis
+    # -------------------------------
+    # Corrected Ketogenesis model
+    # -------------------------------
+    # Rationale:
+    # - Production driven by hyperglycemia (surrogate for insulin deficiency),
+    #   but saturates with very high glucose and as ketones accumulate.
+    # - Clearance is first-order when glucose not strongly elevated.
     if glucose > 200:
-        ketone_rate = 0.0015 * (glucose - 200) * (1.0 + ketones[i-1]/10.0)
+        # glucose factor scales 0 at 200 mg/dL, up to 1 at 500 mg/dL
+        glucose_factor = min((glucose - 200.0) / 300.0, 1.0)
+        # saturation reduces production as ketones approach physiological ceiling
+        saturation_factor = max(1.0 - (ketones[i-1] / KETONE_MAX), 0.0)
+        # production rate bounded by KETONE_PROD_MAX (mmol/L/min)
+        ketone_rate = KETONE_PROD_MAX * glucose_factor * saturation_factor
         ketones[i] = ketones[i-1] + ketone_rate * DT
+        # hard cap at physiological max
+        if ketones[i] > KETONE_MAX:
+            ketones[i] = KETONE_MAX
     else:
-        ketones[i] = max(ketones[i-1] - 0.002 * DT, 0.0)
+        # first-order clearance when glucose lower
+        ketone_rate = -KETONE_CLEARANCE_RATE * ketones[i-1]
+        ketones[i] = max(ketones[i-1] + ketone_rate * DT, 0.0)
 
-    # Glucose mass balance
+    # Numerical stability check after update
+    if not np.isfinite(ketones[i]) or ketones[i] > 1e5:
+        numerical_instability = True
+        instability_message = f"Numerical instability after ketone update at t={time[i]/60:.2f} h: ketones={ketones[i]:.3e}"
+        break
+
+    # Glucose mass balance (mg/kg/min -> mg/dL/min)
     dG_mass = egp + meal_signal[i] - u_ii - renal_mg_kg_min
     dG_conc = dG_mass / (Vd * 10.0)
     noise = np.random.normal(0, noise_level)
@@ -171,6 +210,20 @@ for i in range(1, n_steps):
 
     if i >= 60:
         glucose_roc[i] = G[i] - G[i-60]
+
+# if instability detected, fill remaining arrays with NaN and show error later
+if numerical_instability:
+    # fill remaining indices with NaN to keep lengths consistent
+    for j in range(i+1, n_steps):
+        G[j] = np.nan
+        ketones[j] = np.nan
+        urinary_glucose[j] = np.nan
+        urine_volume[j] = np.nan
+        glucose_roc[j] = np.nan
+        cumulative_egp[j] = cumulative_egp[i]
+        egp_array[j] = egp_array[i]
+        uptake_array[j] = uptake_array[i]
+        renal_array[j] = renal_array[i]
 
 # =========================================================
 # Output DataFrame
@@ -189,7 +242,7 @@ df = pd.DataFrame({
 })
 
 # =========================================================
-# Visualization
+# Visualization (unchanged)
 # =========================================================
 st.title("Untreated Type 1 Diabetes – Advanced Physiological Simulator")
 
@@ -207,31 +260,31 @@ ax.grid(True, alpha=0.3)
 st.pyplot(fig)
 
 # =========================================================
-# Clinical indicators
+# Clinical indicators (unchanged)
 # =========================================================
 dka_time = (np.argmax(ketones >= 3.0) / 60.0) if np.any(ketones >= 3.0) else None
 time_in_target = np.mean((G >= 70) & (G <= 180)) * 100
 time_above_180 = np.mean(G > 180) * simulation_hours
 time_above_250 = np.mean(G > 250) * simulation_hours
-max_roc = np.max(np.abs(glucose_roc))
+max_roc = np.nanmax(np.abs(glucose_roc)) if np.any(np.isfinite(glucose_roc)) else np.nan
 
 st.subheader("Clinical & Educational Indicators")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Peak glucose", f"{np.max(G):.0f} mg/dL")
+c1.metric("Peak glucose", f"{np.nanmax(G):.0f} mg/dL")
 c2.metric("Time in range", f"{time_in_target:.0f}%")
-c3.metric("Max glucose ROC", f"{max_roc:.0f} mg/dL/h")
-c4.metric("Urinary glucose loss", f"{urinary_glucose[-1]/1000:.1f} g")
+c3.metric("Max glucose ROC", f"{max_roc:.0f} mg/dL/h" if np.isfinite(max_roc) else "N/A")
+c4.metric("Urinary glucose loss", f"{(urinary_glucose[-1]/1000.0):.1f} g" if np.isfinite(urinary_glucose[-1]) else "N/A")
 c5.metric("Cumulative EGP", f"{cumulative_egp[-1]:.0f} g")
 c6.metric("Time to DKA", f"{dka_time:.1f} h" if dka_time else "Not reached")
 
 c7, c8, c9, c10 = st.columns(4)
-c7.metric("Urine volume", f"{urine_volume[-1]:.1f} L")
-c8.metric("Peak ketones", f"{np.max(ketones):.2f} mmol/L")
+c7.metric("Urine volume", f"{urine_volume[-1]:.1f} L" if np.isfinite(urine_volume[-1]) else "N/A")
+c8.metric("Peak ketones", f"{np.nanmax(ketones):.2f} mmol/L" if np.any(np.isfinite(ketones)) else "N/A")
 c9.metric("Time >180 mg/dL", f"{time_above_180:.1f} h")
 c10.metric("Time >250 mg/dL", f"{time_above_250:.1f} h")
 
 # =========================================================
-# Interpretation & Teaching Points
+# Interpretation & Teaching Points (unchanged)
 # =========================================================
 st.subheader("Physiological Interpretation")
 with st.expander("📚 Key Teaching Points"):
@@ -251,7 +304,7 @@ if dka_time:
     interpretations.append(("error",
         f"β-hydroxybutyrate exceeds 3.0 mmol/L at {dka_time:.1f} hours, meeting clinical criteria for DKA."
     ))
-if max_roc > 56:
+if np.isfinite(max_roc) and max_roc > 56:
     interpretations.append(("warning",
         f"Glucose rate of rise exceeds 99th percentile (>56 mg/dL/h). Maximum observed: {max_roc:.0f} mg/dL/h."
     ))
@@ -263,6 +316,20 @@ for level, msg in interpretations:
         st.warning(msg)
     else:
         st.info(msg)
+
+# =========================================================
+# Numerical & physiological validation messages
+# =========================================================
+st.sidebar.divider()
+st.sidebar.subheader("Model validation")
+if numerical_instability:
+    st.sidebar.error(instability_message)
+
+if np.nanmax(ketones) > 50:
+    st.sidebar.error("Ketone values exceeded physiological maximum (>50 mmol/L) — numerical instability suspected.")
+
+if np.nanmax(ketones) > KETONE_MAX:
+    st.sidebar.warning(f"Ketones reached the model cap ({KETONE_MAX} mmol/L). Consider reviewing parameters.")
 
 # =========================================================
 # Export CSV
