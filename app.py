@@ -23,33 +23,24 @@ weight = st.sidebar.slider("Body weight (kg)", 40, 120, 70)
 egp_baseline = st.sidebar.slider(
     "Baseline endogenous glucose production (mg/kg/min)",
     1.5, 3.0, 1.6,
-    help=(
-        "Normal basal EGP ≈1.5–2.0 mg/kg/min. In untreated T1DM, "
-        "EGP increases up to ~60% (≈2.7 mg/kg/min) due to unopposed "
-        "glucagon and counter-regulatory hormones. Progressive increase "
-        "simulates insulin withdrawal studies (Voss et al., Diabetologia 2019)."
-    )
+    help="Basal EGP before insulin withdrawal"
 )
 
 brain_uptake = st.sidebar.slider(
     "Insulin-independent glucose uptake (mg/kg/min)",
-    1.0, 1.6, 1.2,
-    help="Primarily reflects cerebral glucose uptake, which is insulin-independent."
+    1.0, 1.6, 1.2
 )
 
 renal_threshold = st.sidebar.slider(
     "Renal glucose threshold (mg/dL)",
-    160, 220, 180,
-    help="Plasma glucose above which glucose appears in urine due to transporter saturation."
+    160, 220, 180
 )
 
 GFR = st.sidebar.slider(
     "GFR (mL/kg/min)",
     1.0, 2.5, 1.7,
-    help=(
-        "Normal adult GFR ≈1.5–2.0 mL/kg/min. "
-        "Lower values simulate renal impairment."
-    )
+    help="Normal adult GFR ≈1.5–2.0 mL/kg/min. "
+         "Lower values simulate renal impairment."
 )
 
 st.sidebar.divider()
@@ -58,12 +49,9 @@ st.sidebar.title("Meal & Simulation")
 meal_carbs = st.sidebar.slider("Meal carbohydrates (g)", 0, 150, 60)
 
 meal_absorption_fraction = st.sidebar.slider(
-    "Fraction absorbed by 5 hours",
+    "Fraction absorbed by 5h",
     0.6, 0.9, 0.8,
-    help=(
-        "Mixed meals ≈60% absorbed by 5h. "
-        "Pure carbohydrate meals may reach 80–90%."
-    )
+    help="Mixed meals ≈60%; pure carbohydrate meals may reach 80–90%"
 )
 
 meal_time = st.sidebar.slider("Meal time (hours)", 0, 24, 8)
@@ -75,9 +63,9 @@ noise_level = st.sidebar.slider("Physiological variability", 0.0, 5.0, 1.0)
 # Physiological constants
 # =========================================================
 
-DT = 1
-Vd = 0.20
-TMAX_GLUCOSE = 375
+DT = 1                      # min
+Vd = 0.20                   # L/kg
+TMAX_GLUCOSE = 375          # mg/min
 
 # =========================================================
 # Time grid
@@ -110,7 +98,7 @@ def meal_absorption(t, meal_time_h, carbs_g, weight, fraction):
     if start >= 0 and end < len(t):
         signal[start:end] = absorbed
 
-    return signal / weight
+    return signal / weight  # mg/kg/min
 
 meal_signal = meal_absorption(
     time, meal_time, meal_carbs, weight, meal_absorption_fraction
@@ -124,10 +112,11 @@ G = np.zeros_like(time)
 G[0] = 100
 
 ketones = np.zeros_like(time)
-urinary_glucose = np.zeros_like(time)
-urine_volume = np.zeros_like(time)
+urinary_glucose = np.zeros_like(time)   # mg
+urine_volume = np.zeros_like(time)      # L
 glucose_roc = np.zeros_like(time)
-cumulative_egp = np.zeros_like(time)
+
+cumulative_egp = np.zeros_like(time)    # g
 
 # =========================================================
 # Simulation loop
@@ -199,34 +188,49 @@ st.title("Untreated Type 1 Diabetes – Advanced Physiological Simulator")
 
 fig, ax = plt.subplots(figsize=(12, 5))
 ax.plot(df["Time (h)"], df["Glucose (mg/dL)"], linewidth=2)
-ax.axhline(180, linestyle="--", color="orange", label="Hyperglycemia (>180 mg/dL)")
-ax.axhline(250, linestyle="--", color="red", label="DKA Risk (>250 mg/dL)")
+ax.axhline(180, linestyle="--", color="orange")
+ax.axhline(250, linestyle="--", color="red")
 ax.set_xlabel("Time (h)")
 ax.set_ylabel("Glucose (mg/dL)")
-ax.legend()
 st.pyplot(fig)
 
 # =========================================================
-# Teaching Points
+# Clinical indicators
 # =========================================================
 
-with st.expander("📚 Key Teaching Points"):
-    st.markdown("""
-**Pathophysiology of Untreated Type 1 Diabetes**
+dka_time = (
+    np.argmax(ketones >= 3.0) / 60
+    if np.any(ketones >= 3.0)
+    else None
+)
 
-- **Absolute insulin deficiency** → Unopposed hepatic glucose production  
-- **Progressive EGP elevation** → Counter-regulatory hormone dominance  
-- **Renal compensation limits** → Glucosuria cannot prevent severe hyperglycemia  
-- **Insulin-independent uptake** → Brain glucose utilization increases but is insufficient  
-- **Ketogenesis** → β-hydroxybutyrate ≥3.0 mmol/L defines DKA  
-- **Osmotic diuresis** → Each gram of glucose excreted carries ~18 mL of water  
+st.subheader("Clinical & Educational Indicators")
 
-**Clinical Correlates**
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-- Glucose ROC >56 mg/dL/h exceeds the 99th percentile for health  
-- DKA typically develops within 14–18 hours of complete insulin withdrawal  
-- Polyuria reflects osmotic diuresis secondary to glucosuria  
-""")
+c1.metric("Peak glucose", f"{np.max(G):.0f} mg/dL")
+c2.metric("Max glucose ROC", f"{np.max(glucose_roc):.0f} mg/dL/h")
+c3.metric("Urinary glucose loss", f"{urinary_glucose[-1]/1000:.1f} g")
+c4.metric("Urine volume", f"{urine_volume[-1]:.1f} L")
+c5.metric("Cumulative EGP", f"{cumulative_egp[-1]:.1f} g")
+c6.metric("Time to DKA", f"{dka_time:.1f} h" if dka_time else "Not reached")
+
+# =========================================================
+# Interpretation
+# =========================================================
+
+st.subheader("Physiological Interpretation")
+
+if dka_time:
+    st.error(
+        "β-hydroxybutyrate exceeds 3.0 mmol/L, meeting clinical criteria for DKA."
+    )
+
+if np.max(glucose_roc) > 56:
+    st.warning(
+        "Glucose rate of rise exceeds the 99th percentile (>56 mg/dL/hour), "
+        "indicating severe metabolic dysregulation."
+    )
 
 # =========================================================
 # Export
