@@ -80,14 +80,14 @@ KM_UPTAKE = 180.0           # mg/dL, half-saturation
 # Ketone model parameters (physiologically constrained)
 KETONE_BASELINE = 0.127     # mmol/L baseline
 KETONE_DKA_THRESHOLD = 3.0  # mmol/L diagnostic threshold
-KETONE_TYPICAL_MAX = 8.0    # mmol/L typical DKA max
-KETONE_ABSOLUTE_MAX = 15.0  # mmol/L hard ceiling to prevent overflow
+KETONE_TYPICAL_MAX = 10.0    # mmol/L typical DKA max
+KETONE_ABSOLUTE_MAX = 25.0  # mmol/L hard ceiling to prevent overflow
 
 # Production & utilization parameters (units: mmol/L/min)
 # Base production observed in literature ≈ 0.002 - 0.003 mmol/L/min
-KETONE_BASE_PROD = 0.003    # base production rate at max insulin deficiency
-KM_KETONE = 5.0             # mmol/L, half-saturation constant for production slowdown
-MAX_UTILIZATION = 0.006     # mmol/L/min, maximal utilization (brain + kidney)
+KETONE_BASE_PROD = 0.006    # base production rate at max insulin deficiency
+KM_KETONE = 8.0             # mmol/L, half-saturation constant for production slowdown
+MAX_UTILIZATION = 0.002     # mmol/L/min, maximal utilization (brain + kidney)
 # Clearance half-life when glucose normalizes
 KETONE_CLEARANCE_HALF_LIFE = 240.0  # minutes (~4 hours)
 KETONE_CLEARANCE_RATE = np.log(2.0) / KETONE_CLEARANCE_HALF_LIFE  # per minute
