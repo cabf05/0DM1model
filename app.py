@@ -23,8 +23,7 @@ egp_baseline = st.sidebar.slider(
     1.5, 3.5, 2.4,
     help="Normal basal EGP ≈1.5-2.0 mg/kg/min. In untreated T1DM, "
          "EGP increases up to 60% (to ~2.7 mg/kg/min) due to unopposed "
-         "glucagon and counter-regulatory hormones (Voss 2019). "
-         "Use 2.4-2.9 to simulate insulin withdrawal."
+         "glucagon and counter-regulatory hormones. Use 2.4-2.9 to simulate insulin withdrawal."
 )
 
 brain_uptake = st.sidebar.slider(
@@ -71,8 +70,11 @@ noise_level = st.sidebar.slider(
 # Physiological constants
 # =========================================================
 DT = 1.0                    # min
-Vd = 0.20                   # L/kg (glucose distribution volume)
+Vd = 0.22                   # L/kg (glucose distribution volume)
 TMAX_GLUCOSE = 375          # mg/min (max tubular reabsorption)
+
+U_II_MAX = 2.0              # mg/kg/min, max insulin-independent uptake
+KM_UPTAKE = 180             # mg/dL, half-saturation for Michaelis-Menten
 
 # =========================================================
 # Time grid
@@ -84,10 +86,9 @@ n_steps = len(time)
 # Meal absorption
 # =========================================================
 def meal_absorption(t, meal_time_h, carbs_g, weight, fraction):
-    """Models carbohydrate absorption as Gaussian distribution (peak ~1h, duration 5h)"""
     if carbs_g == 0:
         return np.zeros_like(t, dtype=float)
-    duration = 300  # 5 hours in minutes
+    duration = 300
     std = 60
     peak = meal_time_h * 60 + 60
     x = np.arange(duration, dtype=float)
@@ -101,7 +102,7 @@ def meal_absorption(t, meal_time_h, carbs_g, weight, fraction):
         signal[start:end] = absorbed
     elif start < len(t):
         signal[start:] = absorbed[:len(t)-start]
-    return signal / weight  # mg/kg/min
+    return signal / weight
 
 meal_signal = meal_absorption(time, meal_time, meal_carbs, weight, meal_absorption_fraction)
 
@@ -110,15 +111,14 @@ meal_signal = meal_absorption(time, meal_time, meal_carbs, weight, meal_absorpti
 # =========================================================
 G = np.zeros(n_steps, dtype=float)
 G[0] = 100.0
-
 ketones = np.zeros(n_steps, dtype=float)
-urinary_glucose = np.zeros(n_steps, dtype=float)   # mg total
-urine_volume = np.zeros(n_steps, dtype=float)      # L total
-glucose_roc = np.zeros(n_steps, dtype=float)       # mg/dL/h
-cumulative_egp = np.zeros(n_steps, dtype=float)    # g total
-egp_array = np.zeros(n_steps, dtype=float)         # mg/kg/min at each time
-uptake_array = np.zeros(n_steps, dtype=float)      # mg/kg/min at each time
-renal_array = np.zeros(n_steps, dtype=float)       # mg/kg/min at each time
+urinary_glucose = np.zeros(n_steps, dtype=float)
+urine_volume = np.zeros(n_steps, dtype=float)
+glucose_roc = np.zeros(n_steps, dtype=float)
+cumulative_egp = np.zeros(n_steps, dtype=float)
+egp_array = np.zeros(n_steps, dtype=float)
+uptake_array = np.zeros(n_steps, dtype=float)
+renal_array = np.zeros(n_steps, dtype=float)
 
 # =========================================================
 # Simulation loop
@@ -126,49 +126,46 @@ renal_array = np.zeros(n_steps, dtype=float)       # mg/kg/min at each time
 for i in range(1, n_steps):
     glucose = G[i - 1]
 
-    # Progressive EGP increase
+    # Progressive EGP
     hours_hyper = np.sum(G[:i] > 180) / 60.0
     egp_multiplier = min(1.0 + 0.1 * hours_hyper, 1.6)
 
-    # Dawn phenomenon (4–8 AM)
+    # Dawn phenomenon
     hour = (time[i] / 60.0) % 24
     dawn_multiplier = 1.15 if 4 <= hour <= 8 else 1.0
 
     egp = egp_baseline * egp_multiplier * dawn_multiplier
     egp_array[i] = egp
-    cumulative_egp[i] = cumulative_egp[i-1] + egp * DT * weight / 1000.0  # grams
+    cumulative_egp[i] = cumulative_egp[i-1] + egp * DT * weight / 1000.0
 
-    # Insulin-independent glucose uptake
-    if glucose > 180:
-        u_ii = brain_uptake * (1.0 + 0.01 * (glucose - 180))
-    else:
-        u_ii = brain_uptake
+    # Insulin-independent uptake (Michaelis-Menten saturation)
+    u_ii = U_II_MAX * glucose / (KM_UPTAKE + glucose)
     uptake_array[i] = u_ii
 
-    # Renal glucose handling
+    # Renal glucose handling (mg/dL → mg/min)
     if glucose > renal_threshold:
-        GFR_total = GFR * weight
-        filtered = (GFR_total / 1000.0) * glucose
-        reabsorbed = min(filtered, TMAX_GLUCOSE / 1000.0)
-        excreted = max(filtered - reabsorbed, 0.0)
-        renal_mg_kg_min = (excreted * 1000.0) / weight
+        GFR_total = GFR * weight  # mL/min
+        filtered_mg_min = (GFR_total * glucose) / 100.0  # correct mg/min
+        reabsorbed_mg_min = min(filtered_mg_min, TMAX_GLUCOSE)
+        excreted_mg_min = max(filtered_mg_min - reabsorbed_mg_min, 0.0)
+        renal_mg_kg_min = excreted_mg_min / weight
     else:
         renal_mg_kg_min = 0.0
     renal_array[i] = renal_mg_kg_min
 
     urinary_glucose[i] = urinary_glucose[i-1] + renal_mg_kg_min * weight * DT
-    urine_volume[i] = (urinary_glucose[i] / 1000.0) * 0.018  # 18 mL per gram
+    urine_volume[i] = (urinary_glucose[i] / 1000.0) * 0.018
 
     # Ketogenesis
     if glucose > 200:
-        ketone_rate = 0.0015 * (glucose - 200) * (1 + ketones[i-1]/10.0)
+        ketone_rate = 0.0015 * (glucose - 200) * (1.0 + ketones[i-1]/10.0)
         ketones[i] = ketones[i-1] + ketone_rate * DT
     else:
         ketones[i] = max(ketones[i-1] - 0.002 * DT, 0.0)
 
     # Glucose mass balance
     dG_mass = egp + meal_signal[i] - u_ii - renal_mg_kg_min
-    dG_conc = (dG_mass / Vd) / 10.0
+    dG_conc = dG_mass / (Vd * 10.0)
     noise = np.random.normal(0, noise_level)
     G[i] = max(glucose + dG_conc + noise, 40.0)
 
@@ -241,25 +238,18 @@ with st.expander("📚 Key Teaching Points"):
     st.markdown("""
 **Pathophysiology of Untreated T1DM:**
 
-- **Absolute insulin deficiency** → Unopposed hepatic glucose production
-- **Progressive EGP elevation** → Simulates counter-regulatory hormone effects (glucagon, cortisol)
-- **Renal compensation limits** → Glucosuria cannot prevent hyperglycemia above ~250 mg/dL
-- **Insulin-independent uptake** → Brain glucose utilization increases but is insufficient
-- **Ketogenesis** → Uncontrolled lipolysis produces β-hydroxybutyrate (DKA threshold: 3.0 mmol/L)
-- **Osmotic diuresis** → Each gram of glucose excreted carries ~18 mL of water
-
-**Clinical Correlates:**
-
-- Glucose ROC >56 mg/dL/h exceeds 99th percentile for health
-- DKA develops within 14-18 hours of complete insulin withdrawal
-- Polyuria (>14 cc/kg/h) reflects osmotic diuresis from glucosuria
+- Absolute insulin deficiency → Unopposed hepatic glucose production
+- Progressive EGP elevation → Counter-regulatory hormones
+- Renal compensation limits → Glucosuria cannot prevent hyperglycemia above ~250 mg/dL
+- Insulin-independent uptake → Brain glucose utilization saturates (~2 mg/kg/min)
+- Ketogenesis → β-hydroxybutyrate exceeds 3.0 mmol/L (DKA)
+- Osmotic diuresis → Each gram of glucose excreted carries ~18 mL of water
 """)
 
 interpretations = []
 if dka_time:
     interpretations.append(("error",
-        f"β-hydroxybutyrate exceeds 3.0 mmol/L at {dka_time:.1f} hours, meeting clinical criteria for DKA. "
-        "Reflects uncontrolled lipolysis and hepatic ketogenesis."
+        f"β-hydroxybutyrate exceeds 3.0 mmol/L at {dka_time:.1f} hours, meeting clinical criteria for DKA."
     ))
 if max_roc > 56:
     interpretations.append(("warning",
